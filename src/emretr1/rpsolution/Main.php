@@ -4,65 +4,69 @@ declare(strict_types=1);
 
 namespace emretr1\rpsolution;
 
-use pocketmine\event\server\DataPacketReceiveEvent;
+use pocketmine\player\Player;
+use pocketmine\event\Listener;
+use pocketmine\plugin\PluginBase;
+use pocketmine\scheduler\ClosureTask;
+use pocketmine\resourcepacks\ResourcePack;
 use pocketmine\network\mcpe\protocol\DataPacket;
+use pocketmine\event\server\DataPacketReceiveEvent;
+use pocketmine\network\mcpe\protocol\ClientboundPacket;
+use pocketmine\network\mcpe\protocol\ResourcePackDataInfoPacket;
 use pocketmine\network\mcpe\protocol\ResourcePackChunkDataPacket;
 use pocketmine\network\mcpe\protocol\ResourcePackChunkRequestPacket;
 use pocketmine\network\mcpe\protocol\ResourcePackClientResponsePacket;
-use pocketmine\network\mcpe\protocol\ResourcePackDataInfoPacket;
-use pocketmine\Player;
-use pocketmine\plugin\PluginBase;
-use pocketmine\event\Listener;
-use pocketmine\resourcepacks\ResourcePack;
-use pocketmine\scheduler\ClosureTask;
 
-class Main extends PluginBase implements Listener{
+class Main extends PluginBase implements Listener
+{
 	/** @var PackSendEntry[] */
-	public static $packSendQueue = [];
-	
-	public function onEnable(){
+	public static array $packSendQueue = [];
+
+	protected function onEnable(): void
+	{
 		$this->getServer()->getPluginManager()->registerEvents($this, $this);
-		$this->getScheduler()->scheduleRepeatingTask(new ClosureTask(function (int $currentTick) : void{
-			foreach(self::$packSendQueue as $entry){
-				$entry->tick($currentTick);
+		$this->saveDefaultConfig();
+		$this->getScheduler()->scheduleRepeatingTask(new ClosureTask(function (): void {
+			foreach (self::$packSendQueue as $entry) {
+				$entry->tick();
 			}
-		}), 0);
+		}), (int) $this->getConfig()->get("rp-chunk-send-interval", 30));
 	}
 
-	public function getRpChunkSize() : int{
+	public function getRpChunkSize(): int
+	{
 		return (int) $this->getConfig()->get("rp-chunk-size", 524288);
 	}
 
-	public function getRpChunkSendInterval() : int{
-		return (int) $this->getConfig()->get("rp-chunk-send-interval", 30);
-	}
-	
-	public function onPacketReceive(DataPacketReceiveEvent $event){
-		$player = $event->getPlayer();
+	public function onPacketReceive(DataPacketReceiveEvent $event): void
+	{
+		$origin = $event->getOrigin();
+		$player = $origin->getPlayer();
 		$packet = $event->getPacket();
-		if($packet instanceof ResourcePackClientResponsePacket){
-			if($packet->status === ResourcePackClientResponsePacket::STATUS_SEND_PACKS){
-				$event->setCancelled(true);
+		if (!$player instanceof Player) return;
+		if ($packet instanceof ResourcePackClientResponsePacket) {
+			if ($packet->status === ResourcePackClientResponsePacket::STATUS_SEND_PACKS) {
+				$event->cancel();
 
 				$manager = $this->getServer()->getResourcePackManager();
 
-				self::$packSendQueue[$player->getName()] = $entry = new PackSendEntry($player);
-				$entry->setSendInterval($this->getRpChunkSendInterval());
+				$playerName = $player->getName();
+				self::$packSendQueue[$playerName] = $entry = new PackSendEntry($player);
 
-				foreach($packet->packIds as $uuid){
+				foreach ($packet->packIds as $uuid) {
 					//dirty hack for mojang's dirty hack for versions
 					$splitPos = strpos($uuid, "_");
-					if($splitPos !== false){
+					if ($splitPos !== false) {
 						$uuid = substr($uuid, 0, $splitPos);
 					}
 
 					$pack = $manager->getPackById($uuid);
-					if(!($pack instanceof ResourcePack)){
+					if (!($pack instanceof ResourcePack)) {
 						//Client requested a resource pack but we don't have it available on the server
-						$player->close("", "disconnectionScreen.resourcePack", true);
+						$player->kick("disconnectionScreen.resourcePack");
 						$this->getServer()->getLogger()->debug("Got a resource pack request for unknown pack with UUID " . $uuid . ", available packs: " . implode(", ", $manager->getPackIdList()));
 
-						return false;
+						return;
 					}
 
 					$pk = new ResourcePackDataInfoPacket();
@@ -71,57 +75,55 @@ class Main extends PluginBase implements Listener{
 					$pk->chunkCount = (int) ceil($pack->getPackSize() / $pk->maxChunkSize);
 					$pk->compressedPackSize = $pack->getPackSize();
 					$pk->sha256 = $pack->getSha256();
-					$player->sendDataPacket($pk);
+					$player->getNetworkSession()->sendDataPacket($pk);
 
-					for($i = 0; $i < $pk->chunkCount; $i++){
+					for ($i = 0; $i < $pk->chunkCount; $i++) {
 						$pk2 = new ResourcePackChunkDataPacket();
 						$pk2->packId = $pack->getPackId();
 						$pk2->chunkIndex = $i;
 						$pk2->data = $pack->getPackChunk($pk->maxChunkSize * $i, $pk->maxChunkSize);
-						$pk2->progress = ($pk->maxChunkSize * $i);
+						//$pk2->progress = ($pk->maxChunkSize * $i);
 
 						$entry->addPacket($pk2);
 					}
 				}
 			}
-		}elseif($packet instanceof ResourcePackChunkRequestPacket){
-			$event->setCancelled(true); // dont rely on client
+		} elseif ($packet instanceof ResourcePackChunkRequestPacket) {
+			$event->cancel(); // dont rely on client
 		}
 	}
 }
 
-class PackSendEntry{
+class PackSendEntry
+{
 	/** @var DataPacket[] */
-	protected $packets = [];
-	/** @var int */
-	protected $sendInterval = 30;
+	protected array $packets = [];
 	/** @var Player */
-	protected $player;
-	
-	public function __construct(Player $player){
+	public Player $player;
+
+	public function __construct(Player $player)
+	{
 		$this->player = $player;
 	}
-	
-	public function addPacket(DataPacket $packet) : void{
+
+	public function addPacket(DataPacket $packet): void
+	{
 		$this->packets[] = $packet;
 	}
 
-	public function setSendInterval(int $value) : void{
-		$this->sendInterval = $value;
-	}
-	
-	public function tick(int $tick) : void{
-		if(!$this->player->isConnected()){
+	public function tick(): void
+	{
+		if (!$this->player->isConnected()) {
 			unset(Main::$packSendQueue[$this->player->getName()]);
 			return;
 		}
-		
-		if(($tick % $this->sendInterval) === 0){
-			if($next = array_shift($this->packets)){
-				$this->player->sendDataPacket($next);
-			}else{
-				unset(Main::$packSendQueue[$this->player->getName()]);
+
+		if ($next = array_shift($this->packets)) {
+			if ($next instanceof ClientboundPacket) {
+				$this->player->getNetworkSession()->sendDataPacket($next);
 			}
+		} else {
+			unset(Main::$packSendQueue[$this->player->getName()]);
 		}
 	}
 }
